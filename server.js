@@ -7,8 +7,9 @@ const fs = require('fs');
 const app = express();
 
 // IP&PORT 설정
+// const myHost = "172.20.10.8"; // 프론트엔드 config와 동일하게
 const myHost = 'localhost';  // 프론트엔드 config와 동일하게
-const PORT = 3001;
+const PORT = 8011;
 
 // 업로드 폴더 생성
 const uploadDir = path.join(__dirname, 'uploads');
