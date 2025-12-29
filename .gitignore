@@ -1,3 +1,4 @@
 uploads
 node_modules
 media.db
+package-lock.json

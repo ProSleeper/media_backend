@@ -1,10 +1,11 @@
 const express = require('express');
 const cors = require('cors');
-const Database = require("better-sqlite3");
+const sqlite3 = require('sqlite3').verbose();
 const busboy = require("busboy");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const { promisify } = require('util');
 
 const app = express();
 
@@ -24,58 +25,73 @@ if (!fs.existsSync(uploadDir)) {
 }
 
 // =======================
-// SQLite (better-sqlite3)
+// SQLite (sqlite3)
 // =======================
 const dbPath = path.join(__dirname, "media.db");
 let db;
 
 try {
-    db = new Database(dbPath);
-    console.log("✅ SQLite 데이터베이스 연결 성공 (better-sqlite3)");
+    db = new sqlite3.Database(dbPath, (err) => {
+        if (err) {
+            console.error("❌ DB 연결 실패:", err.message);
+            process.exit(1);
+        }
+        console.log("✅ SQLite 데이터베이스 연결 성공 (sqlite3)");
+    });
 } catch (err) {
     console.error("❌ DB 연결 실패:", err.message);
     process.exit(1);
 }
 
-// 테이블 초기화 - 참조 카운팅 방식
-// file_storage: 실제 파일 저장 (중복 제거)
-db.prepare(
-    `
-    CREATE TABLE IF NOT EXISTS file_storage (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        file_hash TEXT UNIQUE NOT NULL,
-        saved_name TEXT NOT NULL,
-        file_path TEXT NOT NULL,
-        file_size INTEGER NOT NULL,
-        mime_type TEXT NOT NULL,
-        file_type TEXT NOT NULL,
-        ref_count INTEGER DEFAULT 1,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-`
-).run();
+// DB 메서드를 Promise로 변환
+const dbRun = promisify(db.run.bind(db));
+const dbGet = promisify(db.get.bind(db));
+const dbAll = promisify(db.all.bind(db));
 
-// uploaded_media: 사용자 업로드 메타데이터
-db.prepare(
-    `
-    CREATE TABLE IF NOT EXISTS uploaded_media (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        storage_id INTEGER NOT NULL,
-        original_name TEXT NOT NULL,
-        album_name TEXT DEFAULT 'Default',
-        album_path TEXT,
-        uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (storage_id) REFERENCES file_storage(id) ON DELETE CASCADE
-    )
-`
-).run();
+// 테이블 초기화
+const initDatabase = async () => {
+    try {
+        // file_storage 테이블
+        await dbRun(`
+            CREATE TABLE IF NOT EXISTS file_storage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_hash TEXT UNIQUE NOT NULL,
+                saved_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                mime_type TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                ref_count INTEGER DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
 
-// 인덱스 생성
-db.prepare(`CREATE INDEX IF NOT EXISTS idx_file_hash ON file_storage(file_hash)`).run();
-db.prepare(`CREATE INDEX IF NOT EXISTS idx_storage_id ON uploaded_media(storage_id)`).run();
-db.prepare(`CREATE INDEX IF NOT EXISTS idx_album_name ON uploaded_media(album_name)`).run();
+        // uploaded_media 테이블
+        await dbRun(`
+            CREATE TABLE IF NOT EXISTS uploaded_media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                storage_id INTEGER NOT NULL,
+                original_name TEXT NOT NULL,
+                album_name TEXT DEFAULT 'Default',
+                album_path TEXT,
+                uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (storage_id) REFERENCES file_storage(id) ON DELETE CASCADE
+            )
+        `);
 
-console.log("✅ 참조 카운팅 테이블 준비 완료");
+        // 인덱스 생성
+        await dbRun(`CREATE INDEX IF NOT EXISTS idx_file_hash ON file_storage(file_hash)`);
+        await dbRun(`CREATE INDEX IF NOT EXISTS idx_storage_id ON uploaded_media(storage_id)`);
+        await dbRun(`CREATE INDEX IF NOT EXISTS idx_album_name ON uploaded_media(album_name)`);
+
+        console.log("✅ 참조 카운팅 테이블 준비 완료");
+    } catch (err) {
+        console.error("❌ 테이블 초기화 실패:", err.message);
+        process.exit(1);
+    }
+};
+
+initDatabase();
 
 // =======================
 // 미들웨어
@@ -206,7 +222,7 @@ app.post("/api/upload/media", (req, res) => {
         });
     });
 
-    bb.on("finish", () => {
+    bb.on("finish", async () => {
         if (hasError || !fileData) {
             return res.status(400).json({
                 success: false,
@@ -217,20 +233,24 @@ app.post("/api/upload/media", (req, res) => {
         const fileHash = calculateHash(fileData);
         console.log(`🔐 [HASH] ${fileHash}`);
 
-        // 트랜잭션 시작
-        const transaction = db.transaction(() => {
+        try {
+            // 트랜잭션 시작
+            await dbRun("BEGIN TRANSACTION");
+
             // 1. file_storage에서 해시 확인
-            let storage = db.prepare(
-                "SELECT * FROM file_storage WHERE file_hash = ?"
-            ).get(fileHash);
+            let storage = await dbGet(
+                "SELECT * FROM file_storage WHERE file_hash = ?",
+                [fileHash]
+            );
 
             if (storage) {
                 // 기존 파일 존재 - 참조 카운트 증가
                 console.log(`♻️ [REUSE] 기존 파일 재사용 (ref_count: ${storage.ref_count} → ${storage.ref_count + 1})`);
                 
-                db.prepare(
-                    "UPDATE file_storage SET ref_count = ref_count + 1 WHERE id = ?"
-                ).run(storage.id);
+                await dbRun(
+                    "UPDATE file_storage SET ref_count = ref_count + 1 WHERE id = ?",
+                    [storage.id]
+                );
                 
                 storage.ref_count += 1;
             } else {
@@ -246,14 +266,15 @@ app.post("/api/upload/media", (req, res) => {
 
                 fs.writeFileSync(filePath, fileData);
 
-                const result = db.prepare(
+                const result = await dbRun(
                     `INSERT INTO file_storage
                      (file_hash, saved_name, file_path, file_size, mime_type, file_type, ref_count)
-                     VALUES (?, ?, ?, ?, ?, ?, 1)`
-                ).run(fileHash, savedName, filePath, fileInfo.size, fileInfo.mimeType, fileType);
+                     VALUES (?, ?, ?, ?, ?, ?, 1)`,
+                    [fileHash, savedName, filePath, fileInfo.size, fileInfo.mimeType, fileType]
+                );
 
                 storage = {
-                    id: result.lastInsertRowid,
+                    id: result.lastID,
                     file_hash: fileHash,
                     saved_name: savedName,
                     file_path: filePath,
@@ -268,45 +289,39 @@ app.post("/api/upload/media", (req, res) => {
             const { safeName: safeAlbumName } = ensureAlbumFolder(albumName);
             const albumPath = path.join(safeAlbumName, storage.saved_name);
             
-            const mediaResult = db.prepare(
+            const mediaResult = await dbRun(
                 `INSERT INTO uploaded_media
                  (storage_id, original_name, album_name, album_path)
-                 VALUES (?, ?, ?, ?)`
-            ).run(storage.id, fileInfo.originalName, albumName, albumPath);
+                 VALUES (?, ?, ?, ?)`,
+                [storage.id, fileInfo.originalName, albumName, albumPath]
+            );
+
+            // 트랜잭션 커밋
+            await dbRun("COMMIT");
 
             console.log(`✅ [SUCCESS] 업로드 완료`);
             console.log(`   - Storage ID: ${storage.id} (ref_count: ${storage.ref_count})`);
-            console.log(`   - Media ID: ${mediaResult.lastInsertRowid}`);
+            console.log(`   - Media ID: ${mediaResult.lastID}`);
 
-            return {
-                mediaId: mediaResult.lastInsertRowid,
-                storageId: storage.id,
-                savedName: storage.saved_name,
-                albumPath: albumPath,
-                refCount: storage.ref_count,
-            };
-        });
-
-        try {
-            const result = transaction();
-            
             res.json({
                 success: true,
                 data: {
-                    id: result.mediaId,
-                    storageId: result.storageId,
+                    id: mediaResult.lastID,
+                    storageId: storage.id,
                     originalName: fileInfo.originalName,
-                    savedName: result.savedName,
+                    savedName: storage.saved_name,
                     fileType,
                     fileHash,
                     albumName,
-                    albumPath: result.albumPath,
+                    albumPath: albumPath,
                     size: fileInfo.size,
-                    refCount: result.refCount,
-                    url: `http://${myHost}:${PORT}/uploads/${encodeURIComponent(result.albumPath)}`,
+                    refCount: storage.ref_count,
+                    url: `http://${myHost}:${PORT}/uploads/${encodeURIComponent(albumPath)}`,
                 },
             });
         } catch (err) {
+            // 트랜잭션 롤백
+            await dbRun("ROLLBACK");
             console.error(`❌ [DB ERROR]`, err);
             res.status(500).json({ success: false, error: err.message });
         }
@@ -318,11 +333,11 @@ app.post("/api/upload/media", (req, res) => {
 // =======================
 // 해시 목록 (file_storage 기준)
 // =======================
-app.get("/api/upload/hashes", (req, res) => {
+app.get("/api/upload/hashes", async (req, res) => {
     try {
-        const rows = db.prepare(
+        const rows = await dbAll(
             "SELECT file_hash FROM file_storage ORDER BY created_at DESC"
-        ).all();
+        );
         
         const hashes = rows.map(row => row.file_hash);
         
@@ -339,7 +354,7 @@ app.get("/api/upload/hashes", (req, res) => {
 // =======================
 // 미디어 목록 (JOIN으로 가져오기)
 // =======================
-app.get("/api/upload/media", (req, res) => {
+app.get("/api/upload/media", async (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
     const type = req.query.type;
     const album = req.query.album;
@@ -377,37 +392,40 @@ app.get("/api/upload/media", (req, res) => {
     sql += " ORDER BY m.uploaded_at DESC LIMIT ?";
     params.push(limit);
 
-    const rows = db.prepare(sql).all(...params);
+    try {
+        const rows = await dbAll(sql, params);
 
-    res.json({
-        success: true,
-        count: rows.length,
-        data: rows.map(r => ({
-            id: r.media_id,
-            storageId: r.storage_id,
-            originalName: r.original_name,
-            savedName: r.saved_name,
-            albumName: r.album_name,
-            albumPath: r.album_path,
-            fileSize: r.file_size,
-            mimeType: r.mime_type,
-            fileType: r.file_type,
-            fileHash: r.file_hash,
-            refCount: r.ref_count,
-            uploadedAt: r.uploaded_at,
-            url: `http://${myHost}:${PORT}/uploads/${encodeURIComponent(r.album_path)}`,
-            sizeFormatted: formatFileSize(r.file_size),
-        })),
-    });
+        res.json({
+            success: true,
+            count: rows.length,
+            data: rows.map(r => ({
+                id: r.media_id,
+                storageId: r.storage_id,
+                originalName: r.original_name,
+                savedName: r.saved_name,
+                albumName: r.album_name,
+                albumPath: r.album_path,
+                fileSize: r.file_size,
+                mimeType: r.mime_type,
+                fileType: r.file_type,
+                fileHash: r.file_hash,
+                refCount: r.ref_count,
+                uploadedAt: r.uploaded_at,
+                url: `http://${myHost}:${PORT}/uploads/${encodeURIComponent(r.album_path)}`,
+                sizeFormatted: formatFileSize(r.file_size),
+            })),
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
 });
 
 // =======================
 // 앨범 목록
 // =======================
-app.get("/api/upload/albums", (req, res) => {
+app.get("/api/upload/albums", async (req, res) => {
     try {
-        const rows = db.prepare(
-            `
+        const rows = await dbAll(`
             SELECT 
                 m.album_name,
                 COUNT(*) as count,
@@ -417,8 +435,7 @@ app.get("/api/upload/albums", (req, res) => {
             JOIN file_storage s ON m.storage_id = s.id
             GROUP BY m.album_name
             ORDER BY last_updated DESC
-            `
-        ).all();
+        `);
 
         res.json({
             success: true,
@@ -439,14 +456,14 @@ app.get("/api/upload/albums", (req, res) => {
 // =======================
 // 전체 삭제
 // =======================
-app.delete('/api/upload/media/all', (req, res) => {
+app.delete('/api/upload/media/all', async (req, res) => {
     console.log('🗑️ [DELETE ALL] 전체 삭제 요청');
     
-    const transaction = db.transaction(() => {
+    try {
+        await dbRun("BEGIN TRANSACTION");
+
         // 1. 모든 파일 경로 가져오기
-        const files = db.prepare(
-            "SELECT DISTINCT file_path FROM file_storage"
-        ).all();
+        const files = await dbAll("SELECT DISTINCT file_path FROM file_storage");
         
         // 2. 물리적 파일 삭제
         let deletedFiles = 0;
@@ -462,29 +479,27 @@ app.delete('/api/upload/media/all', (req, res) => {
         }
         
         // 3. DB에서 모든 레코드 삭제
-        const mediaDeleted = db.prepare("DELETE FROM uploaded_media").run();
-        const storageDeleted = db.prepare("DELETE FROM file_storage").run();
+        const mediaDeleted = await dbRun("DELETE FROM uploaded_media");
+        const storageDeleted = await dbRun("DELETE FROM file_storage");
         
+        await dbRun("COMMIT");
+
         console.log(`🗑️ 삭제 완료:`);
         console.log(`   - 물리적 파일: ${deletedFiles}개`);
         console.log(`   - uploaded_media: ${mediaDeleted.changes}개`);
         console.log(`   - file_storage: ${storageDeleted.changes}개`);
         
-        return {
-            deletedFiles,
-            deletedMedia: mediaDeleted.changes,
-            deletedStorage: storageDeleted.changes,
-        };
-    });
-
-    try {
-        const result = transaction();
         res.json({
             success: true,
             message: "모든 데이터가 삭제되었습니다",
-            stats: result,
+            stats: {
+                deletedFiles,
+                deletedMedia: mediaDeleted.changes,
+                deletedStorage: storageDeleted.changes,
+            },
         });
     } catch (err) {
+        await dbRun("ROLLBACK");
         console.error("전체 삭제 오류:", err);
         res.status(500).json({ success: false, error: err.message });
     }
@@ -493,26 +508,31 @@ app.delete('/api/upload/media/all', (req, res) => {
 // =======================
 // 미디어 삭제 (참조 카운팅)
 // =======================
-app.delete('/api/upload/media/:id', (req, res) => {
+app.delete('/api/upload/media/:id', async (req, res) => {
     const mediaId = req.params.id;
 
-    const transaction = db.transaction(() => {
+    try {
+        await dbRun("BEGIN TRANSACTION");
+
         // 1. uploaded_media에서 정보 가져오기
-        const media = db.prepare(
-            "SELECT * FROM uploaded_media WHERE id = ?"
-        ).get(mediaId);
+        const media = await dbGet(
+            "SELECT * FROM uploaded_media WHERE id = ?",
+            [mediaId]
+        );
         
         if (!media) {
-            throw new Error("파일을 찾을 수 없습니다");
+            await dbRun("ROLLBACK");
+            return res.status(404).json({ success: false, message: "파일을 찾을 수 없습니다" });
         }
 
         // 2. file_storage 정보 가져오기
-        const storage = db.prepare(
-            "SELECT * FROM file_storage WHERE id = ?"
-        ).get(media.storage_id);
+        const storage = await dbGet(
+            "SELECT * FROM file_storage WHERE id = ?",
+            [media.storage_id]
+        );
 
         // 3. uploaded_media에서 레코드 삭제
-        db.prepare("DELETE FROM uploaded_media WHERE id = ?").run(mediaId);
+        await dbRun("DELETE FROM uploaded_media WHERE id = ?", [mediaId]);
         console.log(`🗑️ [DELETE MEDIA] ID: ${mediaId}, 파일: ${media.original_name}`);
 
         // 4. file_storage의 ref_count 감소
@@ -525,43 +545,42 @@ app.delete('/api/upload/media/:id', (req, res) => {
                 console.log(`🗑️ [DELETE FILE] 실제 파일 삭제: ${storage.file_path}`);
             }
             
-            db.prepare("DELETE FROM file_storage WHERE id = ?").run(storage.id);
+            await dbRun("DELETE FROM file_storage WHERE id = ?", [storage.id]);
             console.log(`🗑️ [DELETE STORAGE] Storage ID: ${storage.id} (ref_count: 0)`);
         } else {
             // 아직 참조가 남아있으면 ref_count만 감소
-            db.prepare(
-                "UPDATE file_storage SET ref_count = ? WHERE id = ?"
-            ).run(newRefCount, storage.id);
+            await dbRun(
+                "UPDATE file_storage SET ref_count = ? WHERE id = ?",
+                [newRefCount, storage.id]
+            );
             console.log(`📊 [UPDATE REF] Storage ID: ${storage.id} (ref_count: ${storage.ref_count} → ${newRefCount})`);
         }
 
-        return { deletedMedia: true, deletedFile: newRefCount <= 0, newRefCount };
-    });
+        await dbRun("COMMIT");
 
-    try {
-        const result = transaction();
         res.json({ 
             success: true, 
-            deletedFile: result.deletedFile,
-            remainingReferences: result.newRefCount > 0 ? result.newRefCount : 0,
+            deletedFile: newRefCount <= 0,
+            remainingReferences: newRefCount > 0 ? newRefCount : 0,
         });
     } catch (err) {
+        await dbRun("ROLLBACK");
         console.error("삭제 오류:", err);
-        res.status(404).json({ success: false, message: err.message });
+        res.status(500).json({ success: false, message: err.message });
     }
 });
 
 // =======================
 // 통계 정보
 // =======================
-app.get('/api/upload/stats', (req, res) => {
+app.get('/api/upload/stats', async (req, res) => {
     try {
-        const mediaCount = db.prepare("SELECT COUNT(*) as count FROM uploaded_media").get();
-        const storageCount = db.prepare("SELECT COUNT(*) as count FROM file_storage").get();
-        const imageCount = db.prepare("SELECT COUNT(*) as count FROM file_storage WHERE file_type = 'image'").get();
-        const videoCount = db.prepare("SELECT COUNT(*) as count FROM file_storage WHERE file_type = 'video'").get();
-        const totalSize = db.prepare("SELECT SUM(file_size) as size FROM file_storage").get();
-        const albumCount = db.prepare("SELECT COUNT(DISTINCT album_name) as count FROM uploaded_media").get();
+        const mediaCount = await dbGet("SELECT COUNT(*) as count FROM uploaded_media");
+        const storageCount = await dbGet("SELECT COUNT(*) as count FROM file_storage");
+        const imageCount = await dbGet("SELECT COUNT(*) as count FROM file_storage WHERE file_type = 'image'");
+        const videoCount = await dbGet("SELECT COUNT(*) as count FROM file_storage WHERE file_type = 'video'");
+        const totalSize = await dbGet("SELECT SUM(file_size) as size FROM file_storage");
+        const albumCount = await dbGet("SELECT COUNT(DISTINCT album_name) as count FROM uploaded_media");
         
         res.json({
             success: true,
@@ -584,7 +603,7 @@ app.get('/api/upload/stats', (req, res) => {
 // =======================
 // 파일 해시로 확인
 // =======================
-app.post("/api/upload/check-hash", express.json(), (req, res) => {
+app.post("/api/upload/check-hash", async (req, res) => {
     const { hash } = req.body;
     
     if (!hash) {
@@ -594,15 +613,20 @@ app.post("/api/upload/check-hash", express.json(), (req, res) => {
         });
     }
     
-    const storage = db.prepare(
-        "SELECT * FROM file_storage WHERE file_hash = ?"
-    ).get(hash);
-    
-    res.json({
-        success: true,
-        exists: !!storage,
-        data: storage || null,
-    });
+    try {
+        const storage = await dbGet(
+            "SELECT * FROM file_storage WHERE file_hash = ?",
+            [hash]
+        );
+        
+        res.json({
+            success: true,
+            exists: !!storage,
+            data: storage || null,
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
 });
 
 // =======================
@@ -635,7 +659,7 @@ app.get('/', (req, res) => {
 // =======================
 app.listen(PORT, myHost, () => {
     console.log(`🚀 서버 실행: http://${myHost}:${PORT}`);
-    console.log('📡 참조 카운팅 시스템 활성화');
+    console.log('📡 참조 카운팅 시스템 활성화 (sqlite3)');
     console.log('   - 중복 파일 자동 감지');
     console.log('   - 안전한 파일 삭제');
     console.log('   - 저장 공간 최적화');
@@ -654,7 +678,11 @@ app.listen(PORT, myHost, () => {
 // 종료 처리
 // =======================
 process.on("SIGINT", () => {
-    db.close();
-    console.log("\n💾 DB 종료");
-    process.exit(0);
+    db.close((err) => {
+        if (err) {
+            console.error("DB 종료 오류:", err.message);
+        }
+        console.log("\n💾 DB 종료");
+        process.exit(0);
+    });
 });
